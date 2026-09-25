@@ -49,7 +49,7 @@ app = FastAPI(
         "在总预算内最大化 Σ(补报序号数×权重)，同分比指令数、再按箱号/起点/终点"
         "字典序定唯一方案，返回指令、预算消耗与各箱仍缺报区间（预览不写库）"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -150,14 +150,38 @@ def get_states(db: DbSession) -> list[schemas.BoxState]:
 @app.get(
     "/boxes/{box_code}/events",
     tags=["events"],
-    response_model=list[schemas.EventOut],
-    summary="某箱子的全部事件（按序号升序）",
+    response_model=schemas.EventPage,
+    summary="某箱子的事件（按 seq 升序游标分页，首页固定读取水位，翻页期间乱序补报不改变本轮结果）",
 )
-def get_box_events(box_code: str, db: DbSession) -> list[schemas.EventOut]:
-    events = services.list_events(db, box_code.strip())
-    if not events:
+def get_box_events(
+    box_code: str,
+    db: DbSession,
+    page_size: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=100,
+            description="每页最多返回的事件条数（1~100，默认 50）",
+        ),
+    ] = 50,
+    cursor: Annotated[
+        str | None,
+        Query(
+            description="上一页响应返回的 next_cursor（不透明，原样回传）；省略表示首页",
+        ),
+    ] = None,
+) -> schemas.EventPage:
+    code = box_code.strip()
+    result = services.list_events(db, code, page_size, cursor)
+    if result is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
-    return [schemas.EventOut.model_validate(e) for e in events]
+    events, next_cursor = result
+    return schemas.EventPage(
+        box_code=code,
+        page_size=page_size,
+        next_cursor=next_cursor,
+        events=[schemas.EventOut.model_validate(e) for e in events],
+    )
 
 
 def _handoff_out(

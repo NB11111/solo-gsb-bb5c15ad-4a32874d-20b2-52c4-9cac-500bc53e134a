@@ -1,4 +1,6 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、事件游标分页（首页固定读取水位）、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -156,14 +158,120 @@ def latest_state(db: Session, box_code: str) -> models.BoxEvent | None:
     )
 
 
-def list_events(db: Session, box_code: str) -> list[models.BoxEvent]:
-    return list(
-        db.scalars(
-            select(models.BoxEvent)
-            .where(models.BoxEvent.box_code == box_code)
-            .order_by(models.BoxEvent.seq)
-        ).all()
+def _invalid_cursor(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"error": "invalid_cursor", "message": detail},
     )
+
+
+def encode_event_cursor(watermark_id: int, box_code: str, last_seq: int) -> str:
+    """把 (读取水位 id, 箱号, 本页末尾 seq) 编码为不透明的 URL 安全游标字符串。
+
+    载荷为 ["v1", watermark_id, box_code, last_seq] 的 JSON，再做 URL 安全
+    base64 编码；游标不含签名，跨箱/篡改由 decode_event_cursor 校验后拒绝（422）。
+    """
+    raw = json.dumps(
+        ["v1", watermark_id, box_code, last_seq], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_event_cursor(cursor: str, box_code: str) -> tuple[int, int | None]:
+    """解析续页游标并校验归属箱号，返回 (水位 id, 上一页末尾 seq)。
+
+    游标只由服务端在非末页响应中下发，故解码出的 last_seq 必为非负整数；
+    首页（无游标）的 last_seq 由 list_events 自行记为 None。游标格式错误
+    （base64/JSON 无法解析、版本不符、字段缺失或类型非法）或与路径箱号
+    不一致（跨箱使用）一律 422。
+    """
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        raise _invalid_cursor("游标格式错误：无法解析（请使用上次响应返回的 next_cursor）")
+
+    if (
+        not isinstance(payload, list)
+        or len(payload) != 4
+        or payload[0] != "v1"
+        or isinstance(payload[1], bool)
+        or not isinstance(payload[1], int)
+        or payload[1] < 1
+        or not isinstance(payload[2], str)
+        or not payload[2]
+        or len(payload[2]) > 64
+        or isinstance(payload[3], bool)
+        or not isinstance(payload[3], int)
+        or payload[3] < 0
+    ):
+        raise _invalid_cursor("游标格式错误：内容不合法（请使用上次响应返回的 next_cursor）")
+
+    _, watermark_id, cursor_box, last_seq = payload
+    if cursor_box != box_code:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "cursor_box_mismatch",
+                "message": (
+                    f"游标属于箱号 {cursor_box}，不能用于查询箱号 {box_code}"
+                ),
+                "cursor_box_code": cursor_box,
+                "box_code": box_code,
+            },
+        )
+    return watermark_id, last_seq
+
+
+def list_events(
+    db: Session, box_code: str, page_size: int, cursor: str | None
+) -> tuple[list[models.BoxEvent], str | None] | None:
+    """游标分页读取某箱事件（按 seq 升序）。
+
+    返回 (本页事件, 下一页游标)；箱号从未上报过返回 None，由路由层转 404。
+    续页游标格式错误或跨箱使用时抛 422。
+
+    分页稳定性（快照水位）：
+    - 首页固定“读取水位” = 该箱当前最大事件 id（自增主键，严格按入库先后递增）；
+    - 游标只携带 (水位 id, 箱号, 上一页末尾 seq)，续页只取
+      id <= 水位且 seq > 末尾 seq 的记录，多取 1 条用于判断是否还有下一页。
+    因此翻页期间到达的乱序补报（更大的 id）不会出现在本轮遍历中；水位之后
+    补报的低 seq 也不会插入到已读过的页面，本轮遍历结果在首页发起时即固定。
+    要读取补报数据，需不带游标重新发起首页查询（建立新水位）。
+    """
+    if cursor is None:
+        # 首页：水位 = 当前最大事件 id；从未上报过的箱（无任何行）-> None（404）
+        watermark = db.scalar(
+            select(func.max(models.BoxEvent.id)).where(
+                models.BoxEvent.box_code == box_code
+            )
+        )
+        if watermark is None:
+            return None
+        last_seq: int | None = None
+    else:
+        watermark, last_seq = decode_event_cursor(cursor, box_code)
+
+    stmt = (
+        select(models.BoxEvent)
+        .where(
+            models.BoxEvent.box_code == box_code,
+            models.BoxEvent.id <= watermark,
+        )
+        .order_by(models.BoxEvent.seq)
+        .limit(page_size + 1)
+    )
+    if last_seq is not None:
+        stmt = stmt.where(models.BoxEvent.seq > last_seq)
+    rows = list(db.scalars(stmt).all())
+
+    has_next = len(rows) > page_size
+    page = rows[:page_size]
+    next_cursor = (
+        encode_event_cursor(watermark, box_code, page[-1].seq) if has_next else None
+    )
+    return page, next_cursor
 
 
 def _to_epoch_micros(dt: datetime) -> int:

@@ -105,21 +105,30 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 环境变量       | 默认值                          | 说明                                       |
 | -------------- | ------------------------------- | ------------------------------------------ |
 | `DATABASE_URL` | `sqlite:///./data/coldchain.db` | 数据库连接串（SQLAlchemy 格式）            |
-| `APP_HOST`     | `0.0.0.0`                       | 监听地址                                   |
-| `APP_PORT`     | `8000`                          | 监听端口（Compose 左侧映射端口同样取它）   |
+| `APP_HOST`     | `0.0.0.0`                       | 监听地址（本地直接运行 uvicorn 时生效）    |
+| `APP_PORT`     | `8000`                          | 监听端口（本地运行时生效；Compose 下作为宿主机映射端口） |
 
-Compose 下可用 `.env` 或临时变量覆盖，例如改宿主端口：
+Compose 下容器内 uvicorn **固定监听 8000 端口**，`APP_PORT` 只改变**宿主机映射端口**，
+可用 `.env` 或临时变量覆盖，例如把访问端口改成 9000：
 
 ```bash
 APP_PORT=9000 docker compose up -d --build
-# 此时宿主访问端口为 9000
+# 容器内仍监听 8000，宿主机经 9000 访问：http://localhost:9000
 ```
+
+本地不用 Docker 时，`APP_HOST` / `APP_PORT` 可直接作为 uvicorn 参数
+（或设环境变量后由启动命令读取，见上文“本地直接运行”）。
 
 ## API 地址与端口
 
-- 服务地址：`http://localhost:8000`（按上面的端口配置调整）
+- 默认服务地址：`http://localhost:8000`
+  （Compose 下用 `APP_PORT` 改的是宿主机端口，如改成 9000 后访问 `http://localhost:9000`；
+  本地运行则由 uvicorn 的 `--port` 决定）。
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
+
+下文中所有 `curl` 示例均按**默认端口 8000** 书写；端口不同时把 `localhost:8000`
+整体替换即可（路径、参数与响应结构不变）。
 
 ## 接口一览
 
@@ -130,7 +139,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/states`                     | 所有箱子的最新状态（按最大序号）       |
 | GET  | `/boxes`                      | 所有上报过的箱号                       |
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
-| GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
+| GET  | `/boxes/{box_code}/events`    | 单个箱子的事件（按序号升序游标分页，首页固定读取水位） |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
 | GET  | `/boxes/{box_code}/temperature-median` | 区间按持续时间加权的温度中位数（线性插值 + 保序校正时间，不改原始记录） |
@@ -176,6 +185,75 @@ APP_PORT=9000 docker compose up -d --build
 - 同序号内容不一致：`409 Conflict`，响应体带库中已有值与本次值，便于排查
 - 参数非法：`422 Unprocessable Entity`
 - 查询不存在的箱子：`404 Not Found`
+
+## 事件分页查询（/boxes/{box_code}/events）
+
+`GET /boxes/{box_code}/events` 按 **seq 升序分批返回事件**（默认访问端口 **8000**，
+如 `http://localhost:8000/boxes/BOX-001/events`）：
+
+- `page_size`：每页最多返回的事件条数，**整数 1～100**，默认 `50`；越界/缺失/非整数均为 `422`。
+- `cursor`：续页游标，取**上一页响应中的 `next_cursor` 原样回传**；**省略 `cursor` 即为首页**。
+- 响应不再是裸数组，而是：
+
+```json
+{
+  "box_code": "BOX-001",
+  "page_size": 2,
+  "next_cursor": "WyJ2MSIsNSwiQk9YLTAwMSIsMV0",
+  "events": [ { "...": "EventOut（与 POST /events 返回的事件结构相同）" } ]
+}
+```
+
+- **末页** `next_cursor` 为 `null`；此前每一页的 `next_cursor` 都可用于取下一页。
+- 箱号**从未上报过事件**仍返回 `404`（`box_not_found`）。
+
+**读取水位（翻页期间乱序补报不改变本轮遍历结果）**
+
+- **首页**（不带 `cursor`）会把该箱**当前最大事件 id** 固定为本轮遍历的**读取水位**；
+- 游标内嵌三项：**读取水位 id、箱号、本页末尾 seq**；
+- **续页**只取 **`id <= 水位` 且 `seq > 本页末尾 seq`** 的记录。因此翻页过程中
+  到达的乱序/迟到补报（id 更大，哪怕 seq 很小）**不会插入**本轮任何一页；
+  本轮遍历得到的事件集合在首页发起时即固定，页间既不重复也不遗漏。
+- 要读取翻页期间新补报的事件：**不带 `cursor` 重新发起首页查询**（建立新水位）即可。
+- 游标是不透明字符串，客户端只需原样回传：**格式错误**（损坏/篡改/非服务端签发）或
+  **跨箱使用**（A 箱的游标用于 B 箱）均返回 `422`
+  （`error` 分别为 `invalid_cursor` / `cursor_box_mismatch`）。
+
+```bash
+# 首页：每页 2 条
+curl 'http://localhost:8000/boxes/BOX-001/events?page_size=2'
+
+# 续页：把上一页的 next_cursor 原样传入（游标已做 URL 安全编码，通常无需转义）
+curl 'http://localhost:8000/boxes/BOX-001/events?page_size=2&cursor=WyJ2MSIsNSwiQk9YLTAwMSIsMV0'
+
+# 未上报过的箱 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/events'
+
+# page_size 越界（0 / 101 / 非整数 / 缺失值）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-001/events?page_size=0'
+curl -i 'http://localhost:8000/boxes/BOX-001/events?page_size=101'
+
+# 游标损坏或跨箱使用 -> 422
+curl -i 'http://localhost:8000/boxes/BOX-001/events?cursor=not-a-real-cursor'
+curl -i 'http://localhost:8000/boxes/BOX-002/events?cursor=WyJ2MSIsNSwiQk9YLTAwMSIsMV0'
+```
+
+用 shell 自动翻完整轮（末页 `next_cursor` 为 `null` 时停止）：
+
+```bash
+cursor=
+while :; do
+  if [ -z "$cursor" ]; then
+    resp=$(curl -s 'http://localhost:8000/boxes/BOX-001/events?page_size=100')
+  else
+    resp=$(curl -s --get 'http://localhost:8000/boxes/BOX-001/events' \
+      --data-urlencode 'page_size=100' --data-urlencode "cursor=$cursor")
+  fi
+  echo "$resp"
+  cursor=$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["next_cursor"] or "")')
+  [ -z "$cursor" ] && break
+done
+```
 
 ## 使用示例
 
@@ -1426,8 +1504,9 @@ curl -X POST http://localhost:8000/retransmission-preview \
 ```
 
 ```bash
-# 预览不写库：上面查询后 BOX-R1 仍只有 2 条事件
-curl http://localhost:8000/boxes/BOX-R1/events
+# 预览不写库：上面查询后 BOX-R1 仍只有 2 条事件（事件在响应的 events 字段内，按页返回）
+curl -s 'http://localhost:8000/boxes/BOX-R1/events?page_size=100' \
+  | python3 -c 'import json,sys; r=json.load(sys.stdin); print(len(r["events"]), "条事件, next_cursor =", r["next_cursor"])'
 
 # 乱序补报 BOX-R1 的缺号后重查 -> 自动重算（预算转而投给 BOX-R2）
 for s in 0 1 3 4 6 7 8 9; do

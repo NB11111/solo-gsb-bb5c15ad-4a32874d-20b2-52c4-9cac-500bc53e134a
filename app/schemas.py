@@ -42,6 +42,20 @@ class EventAck(BaseModel):
     event: EventOut
 
 
+class EventPage(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    page_size: int = Field(..., description="本页允许的最大事件条数（1~100）")
+    next_cursor: str | None = Field(
+        ...,
+        description=(
+            "下一页游标（不透明字符串，原样回传即可）；为 null 表示已是末页。"
+            "游标内嵌本轮读取水位（首页时该箱最大事件 id）、箱号与本页末尾 seq，"
+            "只能用于同一箱号的续页查询"
+        ),
+    )
+    events: list[EventOut] = Field(..., description="本页事件，按 seq 升序")
+
+
 class BoxState(BaseModel):
     box_code: str
     seq: int
