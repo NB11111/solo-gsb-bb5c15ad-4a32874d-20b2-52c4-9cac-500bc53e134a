@@ -1,4 +1,5 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、事件水位游标分页、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
+import base64
 import hashlib
 import json
 import math
@@ -156,13 +157,139 @@ def latest_state(db: Session, box_code: str) -> models.BoxEvent | None:
     )
 
 
-def list_events(db: Session, box_code: str) -> list[models.BoxEvent]:
-    return list(
+# 事件分页：page_size 允许范围与缺省值（路由层 Query 按 1~100 校验）
+EVENTS_PAGE_DEFAULT_SIZE = 50
+EVENTS_PAGE_MAX_SIZE = 100
+
+# 事件分页游标格式版本号，不匹配的游标一律视为格式错误
+_EVENTS_CURSOR_VERSION = 1
+
+
+def _encode_events_cursor(box_code: str, watermark: int, last_seq: int) -> str:
+    """把翻页状态（读取水位、箱号、本页末尾 seq）编码为不透明游标字符串。
+
+    内容为 JSON（版本号 + 箱号 + 水位 + 末尾 seq），base64url 编码；
+    仅供客户端原样回传，服务端续页时严格校验。
+    """
+    payload = {
+        "v": _EVENTS_CURSOR_VERSION,
+        "box_code": box_code,
+        "watermark": watermark,
+        "last_seq": last_seq,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_events_cursor(cursor: str, box_code: str) -> tuple[int, int]:
+    """解码并校验续页游标，返回 (读取水位, 上页末尾 seq)。
+
+    格式错误（非 base64url/JSON、字段缺失或多出、类型或取值非法、版本不符）
+    抛 422（invalid_cursor）；游标内箱号与路径箱号不一致（跨箱使用）
+    抛 422（cursor_box_mismatch）。
+    """
+    try:
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        # binascii.Error / JSONDecodeError / Unicode*Error 均为 ValueError 子类
+        payload = None
+
+    def _is_int(value) -> bool:
+        # bool 是 int 子类，明确排除，避免 true/false 被当成序号或水位
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"v", "box_code", "watermark", "last_seq"}
+        or payload["v"] != _EVENTS_CURSOR_VERSION
+        or not isinstance(payload["box_code"], str)
+        or not _is_int(payload["watermark"])
+        or payload["watermark"] < 0
+        or not _is_int(payload["last_seq"])
+        or payload["last_seq"] < 0
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_cursor",
+                "message": "游标格式错误：请原样回传上一页响应中的 next_cursor",
+            },
+        )
+
+    if payload["box_code"] != box_code:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "cursor_box_mismatch",
+                "message": (
+                    f"游标属于箱号 {payload['box_code']}，"
+                    f"不能用于查询箱号 {box_code} 的事件"
+                ),
+                "cursor_box_code": payload["box_code"],
+                "box_code": box_code,
+            },
+        )
+    return payload["watermark"], payload["last_seq"]
+
+
+def list_events_page(
+    db: Session, box_code: str, page_size: int, cursor: str | None
+) -> schemas.EventPage | None:
+    """按 seq 升序分批读取某箱事件（水位游标翻页，只读）。
+
+    - 首页（无游标）：先把该箱**当前最大事件 id** 固定为读取水位，
+      只取 id <= 水位的记录；箱号从未上报过返回 None，由路由层转 404
+    - 续页（带游标）：游标携带水位、箱号与上页末尾 seq，只取
+      id <= 水位 且 seq > 末尾 seq 的记录；翻页期间新入库（含乱序补报）
+      的事件 id 必然大于水位，不会进入本轮遍历结果
+    - 游标格式错误或跨箱使用抛 422；多取一条判断是否还有下一页，
+      末页 next_cursor 为 null
+    """
+    if cursor is None:
+        watermark = db.scalar(
+            select(func.max(models.BoxEvent.id)).where(
+                models.BoxEvent.box_code == box_code
+            )
+        )
+        if watermark is None:
+            return None
+        last_seq = -1  # seq 均 >= 0，seq > -1 即从头开始
+    else:
+        watermark, last_seq = _decode_events_cursor(cursor, box_code)
+        box_exists = db.scalar(
+            select(func.count())
+            .select_from(models.BoxEvent)
+            .where(models.BoxEvent.box_code == box_code)
+        )
+        if not box_exists:
+            return None
+
+    # 多取一条：超过 page_size 说明还有下一页，使恰好到末尾的页也直接给出 null 游标
+    rows = list(
         db.scalars(
             select(models.BoxEvent)
-            .where(models.BoxEvent.box_code == box_code)
+            .where(
+                models.BoxEvent.box_code == box_code,
+                models.BoxEvent.id <= watermark,
+                models.BoxEvent.seq > last_seq,
+            )
             .order_by(models.BoxEvent.seq)
+            .limit(page_size + 1)
         ).all()
+    )
+
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    next_cursor = (
+        _encode_events_cursor(box_code, watermark, page[-1].seq) if has_more else None
+    )
+    return schemas.EventPage(
+        box_code=box_code,
+        page_size=page_size,
+        event_count=len(page),
+        events=[schemas.EventOut.model_validate(e) for e in page],
+        next_cursor=next_cursor,
     )
 
 

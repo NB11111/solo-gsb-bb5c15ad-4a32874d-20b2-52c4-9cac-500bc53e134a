@@ -29,6 +29,10 @@ app = FastAPI(
         "- 相同箱号 + 相同序号 + 相同内容：重复上报，幂等忽略（200，status=duplicate）\n"
         "- 相同箱号 + 相同序号但内容不同：拒绝（409）\n"
         "- 乱序事件正常入库，最新状态始终按最大序号返回\n"
+        "- 事件分页：GET /boxes/{box_code}/events 按 seq 升序分批返回（page_size 1~100，"
+        "缺省 50）；首页固定该箱当前最大事件 id 为读取水位，游标保存水位、箱号与本页"
+        "末尾 seq，续页只取 id 不超过水位且 seq 更大的记录，翻页期间的乱序补报不改变"
+        "本轮遍历结果；末页游标为 null，游标格式错误或跨箱使用返回 422\n"
         "- 交接快照：POST /handoffs 在同一事务中冻结各箱当前状态；"
         "同编号同内容幂等返回原快照，内容不同拒绝（409）；快照只读，不受后续补报影响\n"
         "- 交接对账：GET /handoffs/{from_code}/reconcile/{to_code} 只读比较两份已冻结快照，"
@@ -49,7 +53,7 @@ app = FastAPI(
         "在总预算内最大化 Σ(补报序号数×权重)，同分比指令数、再按箱号/起点/终点"
         "字典序定唯一方案，返回指令、预算消耗与各箱仍缺报区间（预览不写库）"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -150,14 +154,29 @@ def get_states(db: DbSession) -> list[schemas.BoxState]:
 @app.get(
     "/boxes/{box_code}/events",
     tags=["events"],
-    response_model=list[schemas.EventOut],
-    summary="某箱子的全部事件（按序号升序）",
+    response_model=schemas.EventPage,
+    summary="某箱子的事件（按序号升序分批，水位游标翻页，补报不影响本轮遍历）",
 )
-def get_box_events(box_code: str, db: DbSession) -> list[schemas.EventOut]:
-    events = services.list_events(db, box_code.strip())
-    if not events:
+def get_box_events(
+    box_code: str,
+    db: DbSession,
+    page_size: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=services.EVENTS_PAGE_MAX_SIZE,
+            description="每页最多返回的事件条数（1~100）",
+        ),
+    ] = services.EVENTS_PAGE_DEFAULT_SIZE,
+    cursor: Annotated[
+        str | None,
+        Query(description="上一页响应中的 next_cursor，原样回传；不传表示从首页开始"),
+    ] = None,
+) -> schemas.EventPage:
+    page = services.list_events_page(db, box_code.strip(), page_size, cursor)
+    if page is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
-    return [schemas.EventOut.model_validate(e) for e in events]
+    return page
 
 
 def _handoff_out(

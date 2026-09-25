@@ -9,6 +9,11 @@
 - **乱序/延迟事件**（序号先到 3 后到 1、中间跳号等）→ 正常入库；
   查询“最新状态”时始终取每个箱子**序号最大**的一条，与到达顺序无关。
 
+事件列表接口 `GET /boxes/{box_code}/events` 支持**水位游标分页**：按 `seq` 升序
+分批返回（`page_size` 1～100），首次查询固定该箱**当前最大事件 id** 为读取水位，
+游标保存水位、箱号与本页末尾 `seq`，续页只取水位之内的记录，
+**翻页期间的乱序补报不会改变本轮遍历结果**；末页游标为 `null`。
+
 此外支持**交接快照**：`POST /handoffs` 在同一事务中按各箱当前最大序号冻结状态与
 缺报/越界/正常结论；快照落库后只读，后续乱序补报不会改写已建快照。
 两份快照之间可用 `GET /handoffs/{from_code}/reconcile/{to_code}` **只读对账**：
@@ -57,7 +62,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent、交接快照、温度漂移校准模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测、多箱补报调度预览
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、事件水位游标分页、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测、多箱补报调度预览
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -130,7 +135,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/states`                     | 所有箱子的最新状态（按最大序号）       |
 | GET  | `/boxes`                      | 所有上报过的箱号                       |
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
-| GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
+| GET  | `/boxes/{box_code}/events`    | 单个箱子的事件（按序号升序分批，水位游标翻页） |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
 | GET  | `/boxes/{box_code}/temperature-median` | 区间按持续时间加权的温度中位数（线性插值 + 保序校正时间，不改原始记录） |
@@ -201,6 +206,84 @@ curl -X POST http://localhost:8000/events \
 # 乱序补报 seq=0 / seq=2 ... 最新状态始终取最大 seq
 curl http://localhost:8000/boxes/BOX-001/state
 curl http://localhost:8000/states
+```
+
+## 事件分页（/boxes/{box_code}/events）
+
+`GET /boxes/{box_code}/events`（默认访问端口 **8000**，如
+`http://localhost:8000/boxes/BOX-001/events`）按 **`seq` 升序分批**返回某箱事件，
+通过**游标**翻页：
+
+- **首次查询**（不带 `cursor`）把该箱**当前最大事件 id** 固定为**读取水位**，
+  只返回 `id <= 水位` 的记录；
+- 响应中的 `next_cursor` 保存**水位、箱号与本页末尾 `seq`**，续页**原样回传**即可，
+  服务端只取 `id <= 水位 且 seq > 末尾 seq` 的记录；
+- 事件 id 自增、只增不改，因此**翻页期间的乱序补报**（无论补的是中间缺号还是
+  更大序号）id 必然大于水位，**不会改变本轮遍历结果**；
+  重新发起首页查询则基于最新数据重新开始；
+- **末页 `next_cursor` 为 `null`**，翻页结束。
+
+查询参数：
+
+| 参数        | 说明                                                                   |
+| ----------- | ---------------------------------------------------------------------- |
+| `page_size` | 每页最多返回的事件条数，**1～100 的整数**，缺省 `50`；越界或非法返回 `422` |
+| `cursor`    | 上一页响应的 `next_cursor`，**原样回传**；不传表示从首页开始             |
+
+返回字段：
+
+| 字段          | 说明                                                               |
+| ------------- | ------------------------------------------------------------------ |
+| `box_code`    | 箱号                                                               |
+| `page_size`   | 本次请求的页大小上限                                               |
+| `event_count` | 本页实际返回的事件条数                                             |
+| `events[]`    | 本页事件（按 `seq` 升序），字段与上报回执中的事件一致              |
+| `next_cursor` | 下一页游标（不透明字符串，内含读取水位、箱号与本页末尾 `seq`）；**末页为 `null`** |
+
+错误情况：游标**格式错误**（无法解码、字段缺失/非法、版本不符等）返回
+`422`（`invalid_cursor`）；**跨箱使用**（游标内箱号与路径箱号不一致）返回
+`422`（`cursor_box_mismatch`）；箱号**从未上报过**返回 `404`（带不带游标都一样）。
+
+```bash
+# 首页：固定读取水位，按 seq 升序返回前 2 条
+curl 'http://localhost:8000/boxes/BOX-001/events?page_size=2'
+```
+
+响应（还有下一页，`next_cursor` 非空）：
+
+```json
+{
+  "box_code": "BOX-001",
+  "page_size": 2,
+  "event_count": 2,
+  "events": [
+    {"box_code": "BOX-001", "seq": 0, "temperature": -4.0,
+     "event_time": "2026-09-25T08:00:00", "created_at": "2026-09-25T08:00:01.123456"},
+    {"box_code": "BOX-001", "seq": 1, "temperature": -4.1,
+     "event_time": "2026-09-25T08:01:00", "created_at": "2026-09-25T08:01:01.123456"}
+  ],
+  "next_cursor": "eyJ2IjoxLCJib3hfY29kZSI6IkJPWC0wMDEiLCJ3YXRlcm1hcmsiOjUsImxhc3Rfc2VxIjoxfQ=="
+}
+```
+
+```bash
+# 续页：原样回传上一页的 next_cursor（URL 中含 = 结尾，建议加引号）
+curl 'http://localhost:8000/boxes/BOX-001/events?page_size=2&cursor=eyJ2IjoxLCJib3hfY29kZSI6IkJPWC0wMDEiLCJ3YXRlcm1hcmsiOjUsImxhc3Rfc2VxIjoxfQ=='
+# -> events 为 seq 2、3，并给出新的 next_cursor；再翻一页得到 seq 4 且
+#    next_cursor 为 null（末页）。翻页期间新上报的事件不会插入本轮遍历。
+
+# page_size 越界（0、101 等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-001/events?page_size=0'
+curl -i 'http://localhost:8000/boxes/BOX-001/events?page_size=101'
+
+# 游标格式错误 -> 422（invalid_cursor）
+curl -i 'http://localhost:8000/boxes/BOX-001/events?cursor=not-a-cursor'
+
+# 跨箱使用游标（把 BOX-001 的游标用于 BOX-002）-> 422（cursor_box_mismatch）
+curl -i 'http://localhost:8000/boxes/BOX-002/events?cursor=eyJ2IjoxLCJib3hfY29kZSI6IkJPWC0wMDEiLCJ3YXRlcm1hcmsiOjUsImxhc3Rfc2VxIjoxfQ=='
+
+# 箱号从未上报过 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/events'
 ```
 
 ## 时钟回拨校正（clock-audit）
@@ -1461,6 +1544,13 @@ curl -i -X POST http://localhost:8000/retransmission-preview \
   重试通常原样重发 JSON，浮点解析结果一致，可直接判等。
 - **乱序安全**：最新状态通过“每箱 `MAX(seq)` 关联回原行”的子查询得到，
   不依赖插入先后，也不要求序号连续。
+- **事件分页水位**：`GET /boxes/{box_code}/events` 首页把该箱当前最大事件 id
+  固定为读取水位，随游标（base64url 编码的 JSON：版本号、箱号、水位、本页末尾
+  `seq`）下发；续页只取 `id <= 水位 且 seq > 上页末尾 seq` 的记录，按 `seq`
+  升序返回。事件 id 自增、只增不改，翻页期间新入库的乱序补报 id 必然大于水位，
+  不会插入本轮遍历，已翻过的页也不会因补报而重复或遗漏；每页多取一条判断是否
+  还有下一页，末页游标为 `null`。游标解码做严格格式校验（字段、类型、版本），
+  格式错误或箱号不匹配（跨箱使用）返回 `422`；箱号从未上报返回 `404`。
 - **时钟校正只读**：`clock-audit` 在查询时即时计算，不写库、不改动原始事件；
   乱序补报后重查即自动重算。时间先精确换算为整数微秒（整数运算，无浮点误差），
   再用 PAVA 做等权保序回归：相邻块出现“前块均值 > 后块均值”时向前合并、

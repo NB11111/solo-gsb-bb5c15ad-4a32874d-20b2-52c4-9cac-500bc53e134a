@@ -42,6 +42,19 @@ class EventAck(BaseModel):
     event: EventOut
 
 
+class EventPage(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    page_size: int = Field(..., description="本次请求的每页大小上限（1~100）")
+    event_count: int = Field(..., description="本页实际返回的事件条数")
+    events: list[EventOut] = Field(..., description="本页事件（按 seq 升序）")
+    next_cursor: str | None = Field(
+        ...,
+        description=(
+            "下一页游标（不透明字符串，原样回传即可）；已到末页时为 null"
+        ),
+    )
+
+
 class BoxState(BaseModel):
     box_code: str
     seq: int
